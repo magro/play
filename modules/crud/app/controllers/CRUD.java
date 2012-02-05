@@ -6,15 +6,19 @@ import java.lang.annotation.RetentionPolicy;
 import java.lang.annotation.Target;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 
 import play.Logger;
 import play.Play;
+import play.classloading.enhancers.ControllersEnhancer.ControllerInstrumentation;
 import play.data.binding.Binder;
 import play.data.validation.MaxSize;
 import play.data.validation.Password;
@@ -25,10 +29,38 @@ import play.exceptions.TemplateNotFoundException;
 import play.i18n.Messages;
 import play.mvc.Before;
 import play.mvc.Controller;
+import play.mvc.Http;
 import play.mvc.Router;
 import play.utils.Java;
 
 public abstract class CRUD extends Controller {
+
+    /**
+     * Marks a method as <code>@BeforeObjectSave</code> interceptor.
+     *
+     * The method must accept one object as parameter (the object that
+     * shall be saved) and return a <code>boolean</code> indicating if
+     * the object passed to the method should be saved by the calling method,
+     * or if the method annotated with <code>@BeforeObjectSave</code> handles
+     * this on its own.
+     */
+    @Retention(value=RetentionPolicy.RUNTIME)
+    @Target(value={ElementType.METHOD})
+    public static abstract @interface BeforeObjectSave {
+        /**
+         * Does not intercept these actions
+         */
+        String[] unless() default {};
+        /**
+         * Intercepts only these actions.
+         */
+        String[] only() default {};
+
+        /**
+         * Interceptor priority (0 is high priority)
+         */
+        int priority() default 0;
+    }
 
     @Before
     public static void addType() throws Exception {
@@ -112,7 +144,10 @@ public abstract class CRUD extends Controller {
                 render("CRUD/show.html", type, object);
             }
         }
-        object._save();
+        boolean save = handleBeforeObjectSaves(request, object);
+        if (save) {
+            object._save();
+        }
         flash.success(play.i18n.Messages.get("crud.saved", type.modelName));
         if (params.get("_save") != null) {
             redirect(request.controller + ".list");
@@ -133,6 +168,66 @@ public abstract class CRUD extends Controller {
         }
     }
 
+    /**
+     * Invokes all methods annotated with <code>@BeforeObjectSave</code> passing the given
+     * model object to them. The returned result are the &'ed results of the methods.
+     *
+     * Note: implementation is based on ActionInvoker.handleBefores.
+     */
+    private static boolean handleBeforeObjectSaves(Http.Request request, Model object) throws Exception {
+        List<Method> befores = Java.findAllAnnotatedMethods(Controller.getControllerClass(), BeforeObjectSave.class);
+        Collections.sort(befores, new Comparator<Method>() {
+
+            public int compare(Method m1, Method m2) {
+                BeforeObjectSave before1 = m1.getAnnotation(BeforeObjectSave.class);
+                BeforeObjectSave before2 = m2.getAnnotation(BeforeObjectSave.class);
+                return before1.priority() - before2.priority();
+            }
+        });
+        // TODO: Was there in ActionInvoker.handleBefores - is this needed here, too?
+        // ControllerInstrumentation.stopActionCall();
+        boolean result = true;
+        for (Method before : befores) {
+            if(!before.getReturnType().equals(boolean.class)) {
+                throw new RuntimeException("The method " + before + " annotated with @BeforeObjectSave" +
+                        " does not return boolean, which is required.");
+            }
+            if(before.getParameterTypes().length != 1 || !before.getParameterTypes()[0].equals(Object.class)) {
+                throw new RuntimeException("The method " + before + " annotated with @BeforeObjectSave" +
+                        " does not accept 1 object as argument, which is required.");
+            }
+            String[] unless = before.getAnnotation(BeforeObjectSave.class).unless();
+            String[] only = before.getAnnotation(BeforeObjectSave.class).only();
+            boolean skip = false;
+            for (String un : only) {
+                if (!un.contains(".")) {
+                    un = before.getDeclaringClass().getName().substring(12).replace("$", "") + "." + un;
+                }
+                if (un.equals(request.action)) {
+                    skip = false;
+                    break;
+                } else {
+                    skip = true;
+                }
+            }
+            for (String un : unless) {
+                if (!un.contains(".")) {
+                    un = before.getDeclaringClass().getName().substring(12).replace("$", "") + "." + un;
+                }
+                if (un.equals(request.action)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (!skip) {
+                before.setAccessible(true);
+                boolean methodResult = (Boolean) before.invoke(null, object);
+                result &= methodResult;
+            }
+        }
+        return result;
+    }
+
     public static void create() throws Exception {
         ObjectType type = ObjectType.get(getControllerClass());
         notFoundIfNull(type);
@@ -149,7 +244,10 @@ public abstract class CRUD extends Controller {
                 render("CRUD/blank.html", type, object);
             }
         }
-        object._save();
+        boolean save = handleBeforeObjectSaves(request, object);
+        if (save) {
+            object._save();
+        }
         flash.success(play.i18n.Messages.get("crud.created", type.modelName));
         if (params.get("_save") != null) {
             redirect(request.controller + ".list");
